@@ -5,8 +5,10 @@ import dropbox
 from dropbox.exceptions import ApiError, AuthError
 from dropbox.files import WriteMode, UploadSessionCursor, CommitInfo
 
-# Chunk size for large file uploads (4MB)
-CHUNK_SIZE = 4 * 1024 * 1024
+# OPTIMIZATION: Increased chunk size from 4MB to 32MB to minimize network latency
+CHUNK_SIZE = 32 * 1024 * 1024 
+# OPTIMIZATION: Max threshold for single API uploads
+SINGLE_UPLOAD_LIMIT = 150 * 1024 * 1024
 
 def authenticate() -> dropbox.Dropbox:
     """Authenticates with Dropbox using the environment variable."""
@@ -19,7 +21,6 @@ def authenticate() -> dropbox.Dropbox:
     dbx = dropbox.Dropbox(token)
     
     try:
-        # Test the connection by fetching the current account
         account = dbx.users_get_current_account()
         print(f"Successfully connected as {account.name.display_name}")
         return dbx
@@ -35,31 +36,30 @@ def format_destination_path(local_path: str, remote_dir: str) -> str:
     if remote_dir in ["", "/"]:
         return f"/{filename}"
     else:
-        # Ensure it starts with / and doesn't end with /
         if not remote_dir.startswith("/"):
             remote_dir = "/" + remote_dir
         return f"{remote_dir.rstrip('/')}/{filename}"
 
 def upload_file(dbx: dropbox.Dropbox, local_path: str, dest_path: str):
-    """Uploads the file, using chunked upload for large files."""
+    """Uploads file using single-call upload if small, otherwise optimized chunked sessions."""
     file_size = os.path.getsize(local_path)
-    print(f"Uploading {os.path.basename(local_path)} ({file_size / (1024*1024):.2f} MB)...")
-    
-    try:
-        with open(local_path, "rb") as f:
-            # If file is smaller than our chunk size, upload it in one go
-            if file_size <= CHUNK_SIZE:
-                dbx.files_upload(f.read(), dest_path, mode=WriteMode.overwrite)
-            else:
-                # For larger files, use the upload session API to upload in chunks
-                upload_session_start_result = dbx.files_upload_session_start(f.read(CHUNK_SIZE))
-                
-                cursor = UploadSessionCursor(
-                    session_id=upload_session_start_result.session_id, 
-                    offset=f.tell()
-                )
-                commit = CommitInfo(path=dest_path, mode=WriteMode.overwrite)
+    commit = CommitInfo(path=dest_path, mode=WriteMode.overwrite)
 
+    try:
+        # OPTIMIZATION: Bypasses chunking entirely if file is small enough
+        if file_size <= SINGLE_UPLOAD_LIMIT:
+            print("Uploading file in a single optimized batch...")
+            with open(local_path, "rb") as f:
+                dbx.files_upload(f.read(), dest_path, mode=WriteMode.overwrite)
+        
+        # Large files chunked upload session
+        else:
+            print(f"Uploading file in chunks of {CHUNK_SIZE // (1024*1024)}MB...")
+            with open(local_path, "rb") as f:
+                # Start upload session
+                res = dbx.files_upload_session_start(f.read(CHUNK_SIZE))
+                cursor = UploadSessionCursor(session_id=res.session_id, offset=f.tell())
+                
                 while f.tell() < file_size:
                     if (file_size - f.tell()) <= CHUNK_SIZE:
                         # Final chunk
@@ -85,7 +85,6 @@ def main():
     
     args = parser.parse_args()
     
-    # Validate local path
     local_path = os.path.expanduser(args.local_path)
     if not os.path.isfile(local_path):
         print(f"Error: File not found: {local_path}")
@@ -93,7 +92,6 @@ def main():
         
     dest_path = format_destination_path(local_path, args.dest)
     
-    # Authenticate and execute upload
     dbx = authenticate()
     upload_file(dbx, local_path, dest_path)
 

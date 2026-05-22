@@ -19,8 +19,10 @@ custom_theme = Theme({
 })
 console = Console(theme=custom_theme)
 
-# Chunk size for large file uploads (4MB)
-CHUNK_SIZE = 4 * 1024 * 1024
+# OPTIMIZATION: Increased chunk size from 4MB to 32MB to reduce HTTP round-trips on large files
+CHUNK_SIZE = 32 * 1024 * 1024 
+# OPTIMIZATION: Dropbox threshold for single-request uploads
+SINGLE_UPLOAD_LIMIT = 150 * 1024 * 1024 
 
 def authenticate() -> dropbox.Dropbox:
     """Authenticates with Dropbox using an access token."""
@@ -33,37 +35,30 @@ def authenticate() -> dropbox.Dropbox:
     dbx = dropbox.Dropbox(token)
     
     try:
-        # Test the connection by fetching the current account
         account = dbx.users_get_current_account()
         console.print(f"[success]Successfully connected as {account.name.display_name}[/success]")
         return dbx
-    except AuthError as e:
+    except AuthError:
         console.print("[error]Authentication failed. Please check your access token.[/error]")
         sys.exit(1)
 
-def get_file_paths() -> tuple[str, str]:
-    """Interactively prompts the user for local and remote file paths."""
-    local_path = Prompt.ask("\nEnter the [cyan]local path[/cyan] of the file to upload")
-    
-    # Validate local path
-    local_path = os.path.expanduser(local_path)
-    if not os.path.isfile(local_path):
-        console.print(f"[error]File not found: {local_path}[/error]")
-        sys.exit(1)
+def get_file_paths():
+    """Prompts user for paths and validates them."""
+    while True:
+        local_path = Prompt.ask("\nEnter the local path of the file to upload")
+        local_path = os.path.expanduser(local_path.strip())
+        
+        if os.path.isfile(local_path):
+            break
+        console.print(f"[error]File not found at: {local_path}. Please try again.[/error]")
         
     filename = os.path.basename(local_path)
-    
-    remote_dir = Prompt.ask(
-        "Enter the [cyan]remote Dropbox directory[/cyan] (leave empty for main/root)", 
-        default="/"
-    )
-    
-    # Format the remote destination path
+    remote_dir = Prompt.ask("Enter the remote Dropbox directory (e.g., /MyFolder)", default="/")
     remote_dir = remote_dir.strip()
+    
     if remote_dir in ["", "/"]:
         dest_path = f"/{filename}"
     else:
-        # Ensure it starts with / and doesn't end with /
         if not remote_dir.startswith("/"):
             remote_dir = "/" + remote_dir
         dest_path = f"{remote_dir.rstrip('/')}/{filename}"
@@ -71,42 +66,44 @@ def get_file_paths() -> tuple[str, str]:
     return local_path, dest_path
 
 def upload_file(dbx: dropbox.Dropbox, local_path: str, dest_path: str):
-    """Uploads the file, using chunked upload for progress tracking and large files."""
+    """Uploads file efficiently using single or chunked sessions based on size."""
     file_size = os.path.getsize(local_path)
-    
+    commit = CommitInfo(path=dest_path, mode=WriteMode.overwrite)
+
     try:
-        with open(local_path, "rb") as f:
+        # OPTIMIZATION: Files under 150MB are uploaded in a single API call (much faster)
+        if file_size <= SINGLE_UPLOAD_LIMIT:
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                TimeRemainingColumn(),
                 console=console
             ) as progress:
-                
-                task = progress.add_task(f"[info]Uploading {os.path.basename(local_path)}...", total=file_size)
-                
-                # If file is smaller than our chunk size, upload it in one go
-                if file_size <= CHUNK_SIZE:
+                progress.add_task(description="Uploading file in a single batch...", total=None)
+                with open(local_path, "rb") as f:
                     dbx.files_upload(f.read(), dest_path, mode=WriteMode.overwrite)
-                    progress.update(task, advance=file_size)
-                else:
-                    # For larger files, use the upload session API to upload in chunks
-                    upload_session_start_result = dbx.files_upload_session_start(f.read(CHUNK_SIZE))
+        
+        # Large files use chunked upload session with optimized 32MB chunks
+        else:
+            with open(local_path, "rb") as f:
+                with Progress(
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    TimeRemainingColumn(),
+                    console=console
+                ) as progress:
+                    task = progress.add_task(description="Uploading chunks...", total=file_size)
+                    
+                    # Start upload session
+                    res = dbx.files_upload_session_start(f.read(CHUNK_SIZE))
+                    cursor = UploadSessionCursor(session_id=res.session_id, offset=f.tell())
                     progress.update(task, advance=CHUNK_SIZE)
                     
-                    cursor = UploadSessionCursor(
-                        session_id=upload_session_start_result.session_id, 
-                        offset=f.tell()
-                    )
-                    commit = CommitInfo(path=dest_path, mode=WriteMode.overwrite)
-
                     while f.tell() < file_size:
                         if (file_size - f.tell()) <= CHUNK_SIZE:
                             # Final chunk
                             dbx.files_upload_session_finish(f.read(CHUNK_SIZE), cursor, commit)
-                            progress.update(task, advance=(file_size - cursor.offset))
+                            progress.update(task, completed=file_size)
                         else:
                             # Intermediate chunks
                             dbx.files_upload_session_append_v2(f.read(CHUNK_SIZE), cursor)
@@ -122,7 +119,7 @@ def upload_file(dbx: dropbox.Dropbox, local_path: str, dest_path: str):
 
 def main():
     console.print(Panel.fit(
-        "[bold cyan]Dropbox Interactive Uploader[/bold cyan]\n"
+        "[bold cyan]Dropbox Interactive Uploader (Optimized)[/bold cyan]\n"
         "Securely upload files from your local machine to Dropbox.",
         border_style="cyan"
     ))
@@ -132,7 +129,6 @@ def main():
     while True:
         local_path, dest_path = get_file_paths()
         
-        # Confirmation step
         console.print(f"\n[bold]Summary:[/bold]")
         console.print(f"  • [cyan]Local file:[/cyan] {local_path} ({os.path.getsize(local_path) / (1024*1024):.2f} MB)")
         console.print(f"  • [cyan]Destination:[/cyan] {dest_path}")
